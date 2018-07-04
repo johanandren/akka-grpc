@@ -28,7 +28,7 @@ object Grpc {
   }
 
   def grpcFramingEncoder(codec: Codec): Flow[ByteString, ByteString, NotUsed] = {
-    if (codec == Identity) Flow[ByteString].map(frame ⇒ encodeFrame(notCompressed, frame))
+    if (codec == Identity) grpcFramingEncoder
     else Flow[ByteString].map(frame ⇒ encodeFrame(compressed, codec.compress(frame)))
   }
 

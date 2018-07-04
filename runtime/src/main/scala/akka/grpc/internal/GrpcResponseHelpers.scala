@@ -7,15 +7,18 @@ package akka.grpc.internal
 import akka.NotUsed
 import akka.annotation.InternalApi
 import akka.grpc.scaladsl.headers
-import akka.grpc.{Codec, Grpc, GrpcServiceException, ProtobufSerializer}
-import akka.http.scaladsl.model.HttpEntity.LastChunk
-import akka.http.scaladsl.model.{HttpEntity, HttpHeader, HttpResponse}
-import akka.stream.Materializer
-import akka.stream.scaladsl.Source
+import akka.grpc.{ Codec, Grpc, GrpcServiceException, ProtobufSerializer }
+import akka.http.scaladsl.model.HttpEntity.{ ChunkStreamPart, LastChunk }
+import akka.http.scaladsl.model.{ HttpEntity, HttpHeader, HttpResponse }
+import akka.stream._
+import akka.stream.scaladsl.{ Flow, Source }
+import akka.stream.stage.{ GraphStage, GraphStageLogic, InHandler, OutHandler }
+import akka.util.ByteString
 import io.grpc.Status
 
 import scala.collection.immutable
 import scala.concurrent.Future
+import scala.util.{ Failure, Success, Try }
 
 /**
  * Some helpers for creating HTTP responses for use with gRPC
@@ -24,37 +27,80 @@ import scala.concurrent.Future
  */
 @InternalApi // consumed from generated classes so cannot be private
 object GrpcResponseHelpers {
+
+  private class SingleConcat[T](t: T) extends GraphStage[FlowShape[T, T]] {
+    val in = Inlet[T]("SingleConcat.in")
+    val out = Outlet[T]("SingleConcat.in")
+    def shape: FlowShape[T, T] = FlowShape(in, out)
+    def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) with InHandler with OutHandler {
+      def onPush(): Unit = push(out, grab(in))
+      def onPull(): Unit = pull(in)
+
+      override def onUpstreamFinish(): Unit = {
+        emit(out, t)
+        complete(out)
+      }
+      setHandlers(in, out, this)
+    }
+  }
+
+  private class SingleConcatFuture[T](t: Future[T]) extends GraphStage[FlowShape[T, T]] {
+    val in = Inlet[T]("SingleConcat.in")
+    val out = Outlet[T]("SingleConcat.in")
+    def shape: FlowShape[T, T] = FlowShape(in, out)
+    def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) with InHandler with OutHandler {
+      def onPush(): Unit = push(out, grab(in))
+      def onPull(): Unit = pull(in)
+
+      override def onUpstreamFinish(): Unit = {
+        val onComplete: Try[T] => Unit = {
+          case Success(t) =>
+            emit(out, t)
+            complete(out)
+
+          case Failure(ex) =>
+            failStage(ex)
+        }
+        if (t.isCompleted) onComplete(t.value.get)
+        else t.onComplete(getAsyncCallback(onComplete).invoke)(materializer.executionContext)
+      }
+      setHandlers(in, out, this)
+    }
+
+  }
+
+  private val concatOkTrailer = Flow.fromGraph(new SingleConcat[HttpEntity.ChunkStreamPart](trailer(Status.OK)))
+  private val bytesToChunk = Flow[ByteString].map(bytes => HttpEntity.Chunk(bytes))
+  private val failureRecover = Flow[ChunkStreamPart].recover {
+    case e: GrpcServiceException =>
+      trailer(e.status)
+    case e: Exception =>
+      // TODO handle better
+      e.printStackTrace()
+      trailer(Status.UNKNOWN.withCause(e).withDescription("Stream failed"))
+  }
+
   def apply[T](e: Source[T, NotUsed])(implicit m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse =
-    GrpcResponseHelpers(e, Source.single(trailer(Status.OK)))
+    GrpcResponseHelpers(e, concatOkTrailer)
 
   def apply[T](e: Source[T, NotUsed], status: Future[Status])(implicit m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse = {
     implicit val ec = mat.executionContext
     GrpcResponseHelpers(
       e,
-      Source
-        .lazilyAsync(() ⇒ status.map(trailer(_)))
-        .mapMaterializedValue(_ ⇒ NotUsed))
+      Flow.fromGraph(new SingleConcatFuture[HttpEntity.ChunkStreamPart](status.map(trailer(_)))))
   }
 
-  def apply[T](e: Source[T, NotUsed], trail: Source[HttpEntity.LastChunk, NotUsed])(implicit m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse = {
+  def apply[T](e: Source[T, NotUsed], trailConcat: Flow[HttpEntity.ChunkStreamPart, HttpEntity.ChunkStreamPart, NotUsed])(implicit m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse = {
     val outChunks = e
       .map(m.serialize)
       .via(Grpc.grpcFramingEncoder(codec))
-      .map(bytes ⇒ HttpEntity.Chunk(bytes))
-      .concat(trail)
-      .recover {
-        case e: GrpcServiceException =>
-          trailer(e.status)
-        case e: Exception =>
-          // TODO handle better
-          e.printStackTrace()
-          trailer(Status.UNKNOWN.withCause(e).withDescription("Stream failed"))
-      }
+      .via(bytesToChunk)
+      .via(trailConcat)
+      .via(failureRecover)
 
     HttpResponse(
-      headers = immutable.Seq(headers.`Message-Encoding`(codec.name)),
-      entity = HttpEntity.Chunked(Grpc.contentType, outChunks),
-    )
+      headers = headers.`Message-Encoding`(codec.name) :: Nil,
+      entity = HttpEntity.Chunked(Grpc.contentType, outChunks))
   }
 
   def status(status: Status): HttpResponse =
