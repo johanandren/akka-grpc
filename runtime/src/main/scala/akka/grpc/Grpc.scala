@@ -32,6 +32,11 @@ object Grpc {
     else Flow[ByteString].map(frame ⇒ encodeFrame(compressed, codec.compress(frame)))
   }
 
+  def grpcFrameEncodeSingle(bytes: ByteString, codec: Codec): ByteString = {
+    if (codec == Identity) encodeFrame(notCompressed, bytes)
+    else encodeFrame(compressed, codec.compress(bytes))
+  }
+
   @inline
   def encodeFrame(compressedFlag: ByteString, frame: ByteString): ByteString = {
     val length = frame.size

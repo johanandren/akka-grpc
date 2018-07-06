@@ -69,6 +69,7 @@ object GrpcResponseHelpers {
 
   }
 
+  private val okTrailer = trailer(Status.OK)
   private val concatOkTrailer = Flow.fromGraph(new SingleConcat[HttpEntity.ChunkStreamPart](trailer(Status.OK)))
   private val bytesToChunk = Flow[ByteString].map(bytes => HttpEntity.Chunk(bytes))
   private val failureRecover = Flow[ChunkStreamPart].recover {
@@ -78,6 +79,18 @@ object GrpcResponseHelpers {
       // TODO handle better
       e.printStackTrace()
       trailer(Status.UNKNOWN.withCause(e).withDescription("Stream failed"))
+  }
+
+  def apply[T](e: T)(implicit m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse = {
+    // HERE WE COULD almost completely avoid doing any stream stuff since we already have the response
+    val serialized = m.serialize(e)
+    val encoded = Grpc.grpcFrameEncodeSingle(serialized, codec)
+    val chunk = HttpEntity.Chunk(encoded)
+    // do we need the try-catch?
+    val outChunks = Source[HttpEntity.ChunkStreamPart](chunk :: okTrailer :: Nil)
+    HttpResponse(
+      headers = headers.`Message-Encoding`(codec.name) :: Nil,
+      entity = HttpEntity.Chunked(Grpc.contentType, outChunks))
   }
 
   def apply[T](e: Source[T, NotUsed])(implicit m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse =

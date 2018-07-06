@@ -38,7 +38,7 @@ object GrpcMarshalling {
   }
 
   def marshal[T](e: T, m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse =
-    marshalStream(Source.single(e), m, mat, codec)
+    GrpcResponseHelpers(e)(m, mat, codec)
 
   def marshalStream[T](e: Source[T, NotUsed], m: ProtobufSerializer[T], mat: Materializer, codec: Codec): HttpResponse =
     GrpcResponseHelpers(e.asScala)(m, mat, Identity)

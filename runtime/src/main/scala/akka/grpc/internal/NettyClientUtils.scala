@@ -29,6 +29,7 @@ object NettyClientUtils {
     var builder =
       NettyChannelBuilder
         .forAddress(settings.host, settings.port)
+        .usePlaintext()
         .flowControlWindow(NettyChannelBuilder.DEFAULT_FLOW_CONTROL_WINDOW)
 
     builder = settings.trustedCaCertificate.map(c => GrpcSslContexts.forClient.trustManager(loadCert(c)).build)
